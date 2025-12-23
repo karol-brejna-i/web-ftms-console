@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tester Bieżni FTMS</title>
+    <style>
+        body { font-family: sans-serif; padding: 20px; text-align: center; }
+        button { padding: 15px 30px; font-size: 18px; background: #007bff; color: white; border: none; border-radius: 5px; cursor: pointer; }
+        button:disabled { background: #ccc; }
+        #data { margin-top: 20px; font-size: 24px; text-align: left; display: inline-block; }
+        .value { font-weight: bold; color: #007bff; }
+        #log { font-size: 12px; color: #666; margin-top: 20px; white-space: pre-wrap; text-align: left; }
+    </style>
+</head>
+<body>
+
+    <h1>Tester Bieżni (FTMS)</h1>
+    <button id="connectBtn">Połącz z bieżnią</button>
+    
+    <div id="data">
+        <div>Prędkość: <span id="speed" class="value">0.0</span> km/h</div>
+        <div>Dystans: <span id="dist" class="value">0</span> m</div>
+    </div>
+
+    <div id="log">Logi pojawią się tutaj...</div>
+
+    <script>
+        const SERVICE_UUID = 0x1826;      // Fitness Machine
+        const CHAR_DATA_UUID = 0x2ACD;    // Treadmill Data
+
+        const connectBtn = document.getElementById('connectBtn');
+        const logDiv = document.getElementById('log');
+
+        function log(msg) {
+            logDiv.textContent = msg + '\n' + logDiv.textContent.slice(0, 1000);
+            console.log(msg);
+        }
+
+        connectBtn.addEventListener('click', async () => {
+            try {
+                log('Szukam urządzenia...');
+                const device = await navigator.bluetooth.requestDevice({
+                    filters: [{ services: [SERVICE_UUID] }]
+                });
+
+                log(`Połączono z: ${device.name}`);
+                const server = await device.gatt.connect();
+                
+                log('Pobieram serwis...');
+                const service = await server.getPrimaryService(SERVICE_UUID);
+
+                log('Pobieram charakterystykę danych (0x2ACD)...');
+                const characteristic = await service.getCharacteristic(CHAR_DATA_UUID);
+
+                log('Uruchamiam powiadomienia...');
+                await characteristic.startNotifications();
+
+                characteristic.addEventListener('characteristicvaluechanged', handleData);
+                log('Gotowe! Czekam na dane (zacznij biec)...');
+                
+                connectBtn.disabled = true;
+                connectBtn.textContent = "Połączono";
+
+            } catch (error) {
+                log('Błąd: ' + error);
+            }
+        });
+
+        function handleData(event) {
+            const value = event.target.value;
+            // Tutaj następuje "magia" dekodowania bajtów wg standardu FTMS
+            
+            // Bajty flag (pierwsze 2 bajty) mówią nam, jakie pola są obecne
+            const flags = value.getUint16(0, true); 
+            
+            let offset = 2; // Zaczynamy czytać po flagach
+
+            // 1. Instantaneous Speed (zawsze obecna, uint16, jednostka 0.01 km/h)
+            // Jednak upewniamy się, czy bit 0 (More Data) nie zmienia logiki - w FTMS speed jest stały.
+            const speedRaw = value.getUint16(offset, true);
+            const speedKmh = (speedRaw / 100).toFixed(1);
+            document.getElementById('speed').textContent = speedKmh;
+            offset += 2;
+
+            // Sprawdzamy Flagi, aby wiedzieć czy przeskoczyć Average Speed
+            // Bit 1: Average Speed present (jeśli 1, to mamy dodatkowe 2 bajty)
+            if (flags & (1 << 1)) {
+                offset += 2; // Pomijamy średnią prędkość
+            }
+
+            // Bit 2: Total Distance present (jeśli 1, to mamy 3 bajty dystansu)
+            if (flags & (1 << 2)) {
+                // Dystans w FTMS to 24-bitowy integer (3 bajty). JS nie ma getUint24, więc składamy ręcznie:
+                const byte1 = value.getUint8(offset);
+                const byte2 = value.getUint8(offset + 1);
+                const byte3 = value.getUint8(offset + 2);
+                const distance = byte1 + (byte2 << 8) + (byte3 << 16);
+                
+                document.getElementById('dist').textContent = distance;
+                offset += 3;
+            }
+            
+            // Tu można dodać odczyt nachylenia (Bit 3) i innych danych...
+        }
+    </script>
+</body>
+</html>

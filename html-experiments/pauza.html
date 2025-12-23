@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FS-BT-D2 Status Debug</title>
+    <style>
+        body { font-family: monospace; background: #121212; color: #fff; padding: 20px; max-width: 600px; margin: 0 auto; }
+        button { width: 100%; padding: 15px; margin-bottom: 10px; font-weight: bold; cursor: pointer; border: none; }
+        #btnConnect { background: #007bff; color: white; }
+        #btnStart { background: #28a745; color: white; }
+        #btnStop { background: #dc3545; color: white; }
+        button:disabled { opacity: 0.3; }
+        
+        #console { background: #000; border: 1px solid #333; height: 300px; overflow-y: scroll; padding: 10px; text-align: left; font-size: 12px; }
+        .log-row { border-bottom: 1px solid #222; padding: 2px 0; }
+        .hex { color: #ffcc00; font-weight: bold; }
+        .info { color: #888; }
+    </style>
+</head>
+<body>
+    <h3>Diagnostyka Statusu (0x2ADA)</h3>
+    <button id="btnConnect">1. POŁĄCZ</button>
+    <button id="btnStart" disabled>2. WYŚLIJ START</button>
+    <button id="btnStop" disabled>3. WYŚLIJ STOP</button>
+    
+    <div id="console">Logi pojawią się tutaj...</div>
+
+    <script>
+        let ctrlChar;
+
+        function log(msg, isHex = false) {
+            const el = document.getElementById('console');
+            const row = document.createElement('div');
+            row.className = 'log-row';
+            if (isHex) row.innerHTML = `<span class="hex">${msg}</span>`;
+            else row.innerHTML = `<span class="info">${msg}</span>`;
+            el.appendChild(row);
+            el.scrollTop = el.scrollHeight;
+        }
+
+        document.getElementById('btnConnect').onclick = async () => {
+            try {
+                const device = await navigator.bluetooth.requestDevice({
+                    filters: [{ services: [0x1826] }]
+                });
+                const server = await device.gatt.connect();
+                const service = await server.getPrimaryService(0x1826);
+                
+                // 1. CONTROL POINT (do wysyłania Startu)
+                ctrlChar = await service.getCharacteristic(0x2AD9);
+                await ctrlChar.startNotifications(); // Żeby odbierać ACK
+                ctrlChar.oncharacteristicvaluechanged = (e) => {
+                     // Logujemy odpowiedź na komendę
+                     const b = e.target.value;
+                     const hex = [...new Uint8Array(b.buffer)].map(x => x.toString(16).padStart(2,'0').toUpperCase()).join(' ');
+                     log(`ODPOWIEDŹ CONTROL (0x2AD9): [${hex}]`, true);
+                };
+
+                // 2. STATUS (To nas interesuje najbardziej)
+                try {
+                    const statusChar = await service.getCharacteristic(0x2ADA);
+                    await statusChar.startNotifications();
+                    statusChar.oncharacteristicvaluechanged = (e) => {
+                        const b = e.target.value;
+                        // Konwersja na ładny HEX string, np. "04 00"
+                        const hex = [...new Uint8Array(b.buffer)].map(x => x.toString(16).padStart(2,'0').toUpperCase()).join(' ');
+                        
+                        // Interpretacja
+                        let meaning = "Nieznany";
+                        const op = b.getUint8(0);
+                        if(op === 0x01) meaning = "Reset";
+                        if(op === 0x02) meaning = "Stop";
+                        if(op === 0x03) meaning = "Start";
+                        if(op === 0x04) meaning = "Pauza";
+                        
+                        log(`>>> STATUS (0x2ADA): [${hex}] -> ${meaning}`, true);
+                    };
+                    log("Nasłuch statusu aktywny.");
+                } catch(e) { log("Brak char. Statusu"); }
+
+                // Autoryzacja
+                await ctrlChar.writeValue(new Uint8Array([0x00]));
+
+                document.getElementById('btnStart').disabled = false;
+                document.getElementById('btnStop').disabled = false;
+                document.getElementById('btnConnect').style.display = 'none';
+
+            } catch(e) { log("Błąd: " + e); }
+        };
+
+        document.getElementById('btnStart').onclick = async () => {
+            log("Wysyłam START (0x07)...");
+            await ctrlChar.writeValue(new Uint8Array([0x07]));
+        };
+
+        document.getElementById('btnStop').onclick = async () => {
+            log("Wysyłam STOP (0x08 0x01)...");
+            await ctrlChar.writeValue(new Uint8Array([0x08, 0x01]));
+        };
+    </script>
+</body>
+</html>

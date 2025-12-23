@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bieżnia FTMS v3 (Fix Prędkości)</title>
+    <style>
+        body { font-family: sans-serif; padding: 20px; text-align: center; max-width: 600px; margin: 0 auto; }
+        .btn-group { display: flex; gap: 10px; justify-content: center; margin-bottom: 20px; }
+        button { padding: 12px 20px; font-size: 16px; border: none; border-radius: 5px; cursor: pointer; color: white; flex: 1; }
+        #connectBtn { background: #28a745; }
+        #connectBtn:disabled { background: #ccc; }
+        #disconnectBtn { background: #dc3545; }
+        #disconnectBtn:disabled { background: #ccc; }
+        
+        #dataContainer { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; background: #f8f9fa; padding: 20px; border-radius: 10px; border: 1px solid #ddd; }
+        .data-box { text-align: center; }
+        .label { font-size: 0.9rem; color: #666; text-transform: uppercase; letter-spacing: 1px; }
+        .value { font-weight: bold; color: #007bff; font-size: 2.5rem; display: block; }
+        .unit { font-size: 1rem; color: #666; }
+
+        #logBox { width: 100%; height: 200px; margin-top: 20px; border: 1px solid #ccc; overflow-y: scroll; background: #222; color: #0f0; font-family: monospace; padding: 10px; text-align: left; font-size: 11px; }
+        .raw-valid { color: #0f0; } /* Zielony dla dobrych danych */
+        .raw-ignored { color: #888; } /* Szary dla śmieci */
+    </style>
+</head>
+<body>
+
+    <h1>Bieżnia FTMS v3</h1>
+    
+    <div class="btn-group">
+        <button id="connectBtn">Połącz</button>
+        <button id="disconnectBtn" disabled>Rozłącz</button>
+    </div>
+    
+    <div id="dataContainer">
+        <div class="data-box">
+            <span class="label">Prędkość</span>
+            <span id="speed" class="value">0.0</span>
+            <span class="unit">km/h</span>
+        </div>
+        <div class="data-box">
+            <span class="label">Dystans</span>
+            <span id="dist" class="value">0</span>
+            <span class="unit">m</span>
+        </div>
+    </div>
+
+    <div id="logBox">Gotowy do połączenia...</div>
+
+    <script>
+        const SERVICE_UUID = 0x1826;
+        const CHAR_DATA_UUID = 0x2ACD;
+        const CHAR_CONTROL_UUID = 0x2AD9;
+
+        const connectBtn = document.getElementById('connectBtn');
+        const disconnectBtn = document.getElementById('disconnectBtn');
+        const logBox = document.getElementById('logBox');
+        
+        // Zmienne globalne do trzymania połączenia
+        let deviceCache = null;
+        let serverCache = null;
+        let charCache = null;
+
+        function log(msg, type = 'info') {
+            const timestamp = new Date().toLocaleTimeString();
+            let colorClass = '';
+            if (type === 'valid') colorClass = 'raw-valid';
+            if (type === 'ignored') colorClass = 'raw-ignored';
+            
+            logBox.innerHTML += `<div class="${colorClass}">[${timestamp}] ${msg}</div>`;
+            logBox.scrollTop = logBox.scrollHeight;
+        }
+
+        // --- POŁĄCZENIE ---
+        connectBtn.addEventListener('click', async () => {
+            try {
+                log('Szukam urządzenia...');
+                deviceCache = await navigator.bluetooth.requestDevice({
+                    filters: [{ services: [SERVICE_UUID] }]
+                });
+
+                // Obsługa rozłączenia z poziomu systemu (np. utrata zasięgu)
+                deviceCache.addEventListener('gattserverdisconnected', onDisconnected);
+
+                log(`Łączę z: ${deviceCache.name}...`);
+                serverCache = await deviceCache.gatt.connect();
+                
+                log('Pobieram serwis...');
+                const service = await serverCache.getPrimaryService(SERVICE_UUID);
+
+                // Autoryzacja (Request Control)
+                try {
+                    const controlPoint = await service.getCharacteristic(CHAR_CONTROL_UUID);
+                    await controlPoint.writeValue(new Uint8Array([0x00]));
+                    log('Autoryzacja OK (Control Point).');
+                } catch (e) {
+                    log('Info: Autoryzacja pominięta/błąd: ' + e);
+                }
+
+                log('Subskrybuję dane...');
+                charCache = await service.getCharacteristic(CHAR_DATA_UUID);
+                await charCache.startNotifications();
+                charCache.addEventListener('characteristicvaluechanged', handleData);
+
+                log('POŁĄCZONO!');
+                updateUIState(true);
+
+            } catch (error) {
+                log('Błąd połączenia: ' + error);
+            }
+        });
+
+        // --- ROZŁĄCZENIE (Przycisk) ---
+        disconnectBtn.addEventListener('click', () => {
+            if (deviceCache && deviceCache.gatt.connected) {
+                deviceCache.gatt.disconnect();
+                log('Użytkownik rozłączył.');
+            } else {
+                log('Brak aktywnego połączenia.');
+            }
+        });
+
+        // --- OBSŁUGA ZDARZENIA ROZŁĄCZENIA ---
+        function onDisconnected() {
+            log('Urządzenie rozłączone.');
+            updateUIState(false);
+            deviceCache = null;
+            serverCache = null;
+            charCache = null;
+        }
+
+        function updateUIState(isConnected) {
+            connectBtn.disabled = isConnected;
+            disconnectBtn.disabled = !isConnected;
+            if (!isConnected) {
+                document.getElementById('speed').textContent = "0.0";
+            }
+        }
+
+        // --- PARSOWANIE DANYCH (KLUCZOWA ZMIANA) ---
+        function handleData(event) {
+            const value = event.target.value;
+            
+            // FILTRACJA: Ignorujemy pakiety krótsze niż 10 bajtów
+            // Twoje dobre pakiety mają 19 bajtów, złe mają 5.
+            if (value.byteLength < 10) {
+                // Opcjonalnie: logujemy to na szaro, żeby widzieć że działa
+                // log(`Ignoruję pakiet statusu (${value.byteLength}B)`, 'ignored');
+                return; 
+            }
+
+            // Dekodowanie tylko dla długich pakietów
+            const flags = value.getUint16(0, true);
+            let offset = 2;
+
+            // Logujemy Hex dla pewności
+            let hexCheck = value.getUint8(offset).toString(16).padStart(2,'0') + 
+                           value.getUint8(offset+1).toString(16).padStart(2,'0');
+            
+            // 1. Instantaneous Speed (0.01 km/h)
+            const speedRaw = value.getUint16(offset, true);
+            const speedKmh = (speedRaw / 100).toFixed(1);
+            
+            document.getElementById('speed').textContent = speedKmh;
+            
+            // Logujemy udany odczyt
+            log(`RX [${value.byteLength}B] Speed Raw: 0x${hexCheck} -> ${speedKmh} km/h`, 'valid');
+            
+            offset += 2;
+
+            // 2. Obsługa flag (Average Speed, Distance itd.)
+            if (flags & (1 << 1)) offset += 2; // Avg Speed
+            
+            if (flags & (1 << 2)) { // Total Distance
+                const byte1 = value.getUint8(offset);
+                const byte2 = value.getUint8(offset + 1);
+                const byte3 = value.getUint8(offset + 2);
+                const distance = byte1 + (byte2 << 8) + (byte3 << 16);
+                document.getElementById('dist').textContent = distance;
+                offset += 3;
+            }
+        }
+    </script>
+</body>
+</html>

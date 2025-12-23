@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tester Bieżni FTMS v2 (Debug)</title>
+    <style>
+        body { font-family: sans-serif; padding: 20px; text-align: center; }
+        button { padding: 15px 30px; font-size: 18px; background: #007bff; color: white; border: none; border-radius: 5px; cursor: pointer; margin-bottom: 20px;}
+        button:disabled { background: #ccc; }
+        #dataContainer { display: flex; justify-content: space-around; margin: 20px 0; padding: 20px; background: #f0f0f0; border-radius: 10px; }
+        .data-box { font-size: 1.2rem; }
+        .value { font-weight: bold; color: #007bff; font-size: 2rem; display: block; }
+        #logBox { width: 90%; height: 300px; margin: 0 auto; border: 1px solid #ccc; overflow-y: scroll; background: #333; color: #0f0; font-family: monospace; padding: 10px; text-align: left; font-size: 12px; }
+        .raw-data { color: #ffcc00; }
+    </style>
+</head>
+<body>
+
+    <h1>Tester Bieżni FTMS v2</h1>
+    <button id="connectBtn">Połącz z bieżnią</button>
+    
+    <div id="dataContainer">
+        <div class="data-box">Prędkość: <span id="speed" class="value">0.0</span> km/h</div>
+        <div class="data-box">Dystans: <span id="dist" class="value">0</span> m</div>
+    </div>
+
+    <h3>Logi Debugowania:</h3>
+    <div id="logBox">Czekam na połączenie...</div>
+
+    <script>
+        // --- KONFIGURACJA UUID ---
+        const SERVICE_UUID = 0x1826;      // Fitness Machine Service
+        const CHAR_DATA_UUID = 0x2ACD;    // Treadmill Data (tu są dane)
+        const CHAR_CONTROL_UUID = 0x2AD9; // Control Point (tu wysyłamy komendy)
+
+        const connectBtn = document.getElementById('connectBtn');
+        const logBox = document.getElementById('logBox');
+
+        function log(msg, isRaw = false) {
+            const timestamp = new Date().toLocaleTimeString();
+            const className = isRaw ? 'raw-data' : '';
+            logBox.innerHTML += `<div class="${className}">[${timestamp}] ${msg}</div>`;
+            logBox.scrollTop = logBox.scrollHeight; // Auto-scroll w dół
+        }
+
+        connectBtn.addEventListener('click', async () => {
+            try {
+                log('Rozpoczynam skanowanie urządzenia FTMS (0x1826)...');
+                const device = await navigator.bluetooth.requestDevice({
+                    filters: [{ services: [SERVICE_UUID] }]
+                });
+
+                log(`Wybrano urządzenie: ${device.name}. Łączę...`);
+                const server = await device.gatt.connect();
+                log('Połączono z GATT server.');
+                
+                log('Pobieram główny serwis (0x1826)...');
+                const service = await server.getPrimaryService(SERVICE_UUID);
+
+                // --- NOWOŚĆ: PRÓBA PRZEJĘCIA KONTROLI ---
+                log('--- Próba autoryzacji (Request Control) ---');
+                try {
+                    const controlPoint = await service.getCharacteristic(CHAR_CONTROL_UUID);
+                    // Komenda 0x00 to standardowe "Request control" w FTMS
+                    log(`Wysyłam bajt 0x00 na charakterystykę ${CHAR_CONTROL_UUID.toString(16)}...`);
+                    await controlPoint.writeValue(new Uint8Array([0x00]));
+                    log('SUKCES: Komenda przejęcia kontroli wysłana!');
+                } catch (e) {
+                    log('INFO: Nie udało się wysłać Request Control. ' + 
+                        'Może bieżnia tego nie wymaga, albo ta charakterystyka nie istnieje. ' +
+                        'Błąd: ' + e.message);
+                }
+                log('--- Koniec autoryzacji ---');
+
+                // --- SUBSKRYPCJA DANYCH ---
+                log(`Pobieram charakterystykę danych (${CHAR_DATA_UUID.toString(16)})...`);
+                const characteristic = await service.getCharacteristic(CHAR_DATA_UUID);
+
+                log('Uruchamiam powiadomienia (startNotifications)...');
+                await characteristic.startNotifications();
+                log('Powiadomienia aktywne.');
+
+                characteristic.addEventListener('characteristicvaluechanged', handleData);
+                log('Gotowe! Zacznij biec i obserwuj logi surowych danych (na żółto).');
+                
+                connectBtn.disabled = true;
+                connectBtn.textContent = "Połączono - Monitorowanie...";
+
+            } catch (error) {
+                log('BŁĄD KRYTYCZNY: ' + error);
+                console.error(error);
+            }
+        });
+
+        function handleData(event) {
+            const value = event.target.value; // To jest DataView
+            
+            // --- NOWOŚĆ: LOGOWANIE SUROWYCH BAJTÓW ---
+            let hexString = '';
+            for (let i = 0; i < value.byteLength; i++) {
+                // Konwertujemy każdy bajt na dwucyfrowy HEX (np. 255 -> FF)
+                hexString += value.getUint8(i).toString(16).padStart(2, '0').toUpperCase() + ' ';
+            }
+            // Logujemy na żółto, żeby się wyróżniało
+            log(`RAW RX [${value.byteLength}B]: ${hexString}`, true);
+            // -----------------------------------------
+
+
+            // --- DEKODOWANIE FTMS (Standardowe) ---
+            const flags = value.getUint16(0, true); 
+            let offset = 2; 
+
+            // 1. Prędkość (Instantaneous Speed) - Zawsze na bajtach 2 i 3
+            // Jednostka: 0.01 km/h, uint16, little-endian
+            const speedRaw = value.getUint16(offset, true);
+            const speedKmh = (speedRaw / 100).toFixed(1);
+            document.getElementById('speed').textContent = speedKmh;
+            offset += 2;
+
+            // Sprawdzamy flagę Average Speed (bit 1)
+            if (flags & (1 << 1)) {
+                offset += 2; // Pomijamy średnią prędkość
+            }
+
+            // Sprawdzamy flagę Total Distance (bit 2)
+            if (flags & (1 << 2)) {
+                // Dystans to 3 bajty (uint24)
+                const byte1 = value.getUint8(offset);
+                const byte2 = value.getUint8(offset + 1);
+                const byte3 = value.getUint8(offset + 2);
+                // Składamy 24-bitową liczbę z 3 bajtów little-endian
+                const distance = byte1 + (byte2 << 8) + (byte3 << 16);
+                
+                document.getElementById('dist').textContent = distance;
+                offset += 3;
+            }
+        }
+    </script>
+</body>
+</html>

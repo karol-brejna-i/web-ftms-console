@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bieżnia Final v6</title>
+    <style>
+        body { font-family: sans-serif; padding: 20px; text-align: center; max-width: 600px; margin: 0 auto; background: #f0f2f5; }
+        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-top: 20px; }
+        .card { background: white; padding: 20px; border-radius: 15px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); }
+        .val { font-size: 2.5rem; font-weight: bold; color: #007bff; display: block; }
+        .hr-val { color: #e74c3c; }
+        .unit { color: #888; font-size: 0.9rem; }
+        button { width: 100%; padding: 15px; border-radius: 10px; border: none; font-weight: bold; cursor: pointer; margin: 5px 0; }
+        #btnOn { background: #28a745; color: white; }
+        #btnOff { background: #dc3545; color: white; }
+    </style>
+</head>
+<body>
+    <h2>Monitor Bieżni FS-BT-D2</h2>
+    <button id="btnOn">POŁĄCZ Z BIEŻNIĄ I TĘTNEM</button>
+    <button id="btnOff" disabled>ROZŁĄCZ</button>
+
+    <div class="grid">
+        <div class="card"><span class="unit">PRĘDKOŚĆ</span><span id="s" class="val">0.0</span><span class="unit">km/h</span></div>
+        <div class="card"><span class="unit">DYSTANS</span><span id="d" class="val">0</span><span class="unit">m</span></div>
+        <div class="card"><span class="unit">CZAS</span><span id="t" class="val">00:00</span><span class="unit">min:sek</span></div>
+        <div class="card"><span class="unit">TĘTNO</span><span id="h" class="val hr-val">--</span><span class="unit">BPM</span></div>
+    </div>
+
+    <script>
+        let device = null;
+
+        document.getElementById('btnOn').onclick = async () => {
+            try {
+                // Prosimy o oba serwisy naraz
+                device = await navigator.bluetooth.requestDevice({
+                    filters: [{ services: [0x1826] }],
+                    optionalServices: [0x180D] 
+                });
+
+                const server = await device.gatt.connect();
+                
+                // 1. Serwis Bieżni
+                const ftms = await server.getPrimaryService(0x1826);
+                const ctrl = await ftms.getCharacteristic(0x2AD9);
+                await ctrl.writeValue(new Uint8Array([0x00])); // Request Control
+                
+                const data = await ftms.getCharacteristic(0x2ACD);
+                await data.startNotifications();
+                data.oncharacteristicvaluechanged = handleTreadmill;
+
+                // 2. Serwis Tętna (Ten nowo znaleziony!)
+                try {
+                    const hrService = await server.getPrimaryService(0x180D);
+                    const hrData = await hrService.getCharacteristic(0x2A37);
+                    await hrData.startNotifications();
+                    hrData.oncharacteristicvaluechanged = handleHR;
+                } catch(e) { console.log("Brak HR lub błąd połączenia HR"); }
+
+                document.getElementById('btnOn').disabled = true;
+                document.getElementById('btnOff').disabled = false;
+            } catch (e) { alert("Błąd: " + e); }
+        };
+
+        document.getElementById('btnOff').onclick = () => { device.gatt.disconnect(); location.reload(); };
+
+        function handleTreadmill(event) {
+            const b = event.target.value;
+            if (b.byteLength < 15) return; // Ignoruj krótkie pakiety statusowe
+
+            // Prędkość (Index 2-3)
+            document.getElementById('s').textContent = (b.getUint16(2, true) / 100).toFixed(1);
+            
+            // Dystans (Index 4-6)
+            const dist = b.getUint8(4) + (b.getUint8(5) << 8) + (b.getUint8(6) << 16);
+            document.getElementById('d').textContent = dist;
+
+            // Czas - Skorygowany na podstawie Twoich logów (Ostatnie 2 bajty paczki 19B)
+            const timeRaw = b.getUint16(b.byteLength - 2, true);
+            const m = Math.floor(timeRaw / 60);
+            const s = timeRaw % 60;
+            document.getElementById('t').textContent = `${m}:${s.toString().padStart(2,'0')}`;
+        }
+
+        function handleHR(event) {
+            const b = event.target.value;
+            // Standardowy format HR (2A37): pierwszy bajt to flaga, drugi to tętno
+            const hr = b.getUint8(1); 
+            document.getElementById('h').textContent = hr;
+        }
+    </script>
+</body>
+</html>
